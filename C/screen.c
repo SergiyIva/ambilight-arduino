@@ -1,5 +1,14 @@
 #include "screen.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <X11/extensions/XShm.h>
+#include <sys/shm.h>
+
+static XImage *g_shmimage = NULL;       // XImage, созданное через XShmCreateImage
+static XShmSegmentInfo g_shminfo;       // структура с инфой о сегменте
+static int g_use_shm = 0;               // флаг: 0 - не используем, 1 - используем
+static int g_shm_inited = 0;
 
 /**
  * Generate a random integer in the specified range [min, max].
@@ -105,8 +114,9 @@ void hsv_to_rgb(float h, float s, float v,
  * @param brightness A percentage to scale the color by
  * @param saturation Saturation adjustment in percent (value added to the original saturation)
  */
-void fillRGB(int i, int min_x, int max_x, int min_y, int max_y, unsigned char values[], 
-			 Display* d, XImage* image, int pixels_to_process, int brightness, int saturation) {
+void fillRGB(int i, int min_x, int max_x, int min_y, int max_y,
+             unsigned char values[], Display* d, XImage* image,
+             int pixels_to_process, int brightness, int saturation) {
 	int total[3] = {0, 0, 0};
 	int x, y;
 	XColor c;
@@ -147,12 +157,80 @@ void fillRGB(int i, int min_x, int max_x, int min_y, int max_y, unsigned char va
     if (s > 1.0f) s = 1.0f; // max limit
 
     // Convert to RGB
-    hsv_to_rgb(h, s, v, &r, &g, &b);	
+	hsv_to_rgb(h, s, v, (unsigned char *)&r, (unsigned char *)&g, (unsigned char *)&b);
     
     // Write the final color into the array (3 bytes per LED)
     values[i + 0] = (unsigned char)r;
     values[i + 1] = (unsigned char)g;
     values[i + 2] = (unsigned char)b;
+}
+
+/**
+ * Инициализация XShm (однократно) при первом вызове. Если не удалось, будет use_shm=0.
+ */
+static void init_xshm(Display *d, int width, int height)
+{
+    // Если уже инициализировались раньше, не делаем повторно
+    if (g_shm_inited) {
+        return;
+    }
+    g_shm_inited = 1;
+
+    // Проверяем, доступно ли расширение
+    if (!XShmQueryExtension(d)) {
+        fprintf(stderr, "XShm extension not available. Falling back to XGetImage.\n");
+        g_use_shm = 0;
+        return;
+    }
+
+    // Пытаемся создать XImage через XShm
+    int screen_n = DefaultScreen(d);
+    Visual *vis = DefaultVisual(d, screen_n);
+    int depth = DefaultDepth(d, screen_n);
+
+    g_shmimage = XShmCreateImage(d, vis, depth, ZPixmap, NULL, &g_shminfo, width, height);
+    if (!g_shmimage) {
+        fprintf(stderr, "XShmCreateImage failed. Fallback to XGetImage.\n");
+        g_use_shm = 0;
+        return;
+    }
+
+    // Выделяем общий сегмент памяти
+    size_t image_size = g_shmimage->bytes_per_line * g_shmimage->height;
+    g_shminfo.shmid = shmget(IPC_PRIVATE, image_size, IPC_CREAT | 0777);
+    if (g_shminfo.shmid < 0) {
+        fprintf(stderr, "shmget failed. Fallback to XGetImage.\n");
+        XDestroyImage(g_shmimage);
+        g_shmimage = NULL;
+        g_use_shm = 0;
+        return;
+    }
+
+    g_shminfo.shmaddr = (char *)shmat(g_shminfo.shmid, NULL, 0);
+    if (g_shminfo.shmaddr == (char *)-1) {
+        fprintf(stderr, "shmat failed. Fallback to XGetImage.\n");
+        XDestroyImage(g_shmimage);
+        g_shmimage = NULL;
+        g_use_shm = 0;
+        return;
+    }
+
+    g_shmimage->data = g_shminfo.shmaddr;
+    g_shminfo.readOnly = False;
+
+    // Подключаем сегмент к X-серверу
+    if (!XShmAttach(d, &g_shminfo)) {
+        fprintf(stderr, "XShmAttach failed. Fallback to XGetImage.\n");
+        shmdt(g_shminfo.shmaddr);
+        XDestroyImage(g_shmimage);
+        g_shmimage = NULL;
+        g_use_shm = 0;
+        return;
+    }
+
+    // Если дошли сюда, всё хорошо
+    g_use_shm = 1;
+    fprintf(stderr, "XShm successfully initialized.\n");
 }
 
 /**
@@ -163,11 +241,50 @@ void fillRGB(int i, int min_x, int max_x, int min_y, int max_y, unsigned char va
  * @param cnf config
  */
 void get_colors(Display *d, unsigned char *values, unsigned t, struct config *cnf) {
-	XImage *image;
-
 	srand(t); // Initialising random
 
-	image = XGetImage(d, RootWindow(d, DefaultScreen(d)), 0, 0, cnf->horizontal_pixel_count, cnf->vertical_pixel_count, AllPlanes, ZPixmap);
+    XImage *image = NULL;
+
+    if (g_use_shm && g_shmimage) {
+        // Считываем в g_shmimage
+        Status st = XShmGetImage(
+            d,
+            RootWindow(d, DefaultScreen(d)),
+            g_shmimage,
+            0,
+            0,
+            AllPlanes
+        );
+        if (st == 0) {
+            // На всякий случай fallback, если XShmGetImage не смог
+            fprintf(stderr, "XShmGetImage failed unexpectedly. Using fallback.\n");
+            image = XGetImage(
+                d,
+                RootWindow(d, DefaultScreen(d)),
+                0,
+                0,
+                cnf->horizontal_pixel_count,
+                cnf->vertical_pixel_count,
+                AllPlanes,
+                ZPixmap
+            );
+        } else {
+            image = g_shmimage; // Успешно считали кадр
+        }
+    }
+    else {
+        // Fallback
+        image = XGetImage(
+            d,
+            RootWindow(d, DefaultScreen(d)),
+            0,
+            0,
+            cnf->horizontal_pixel_count,
+            cnf->vertical_pixel_count,
+            AllPlanes,
+            ZPixmap
+        );
+    }
 
     int ledsSide = cnf->leds_on_side;
     int ledsTop  = cnf->leds_on_top;
@@ -244,5 +361,7 @@ void get_colors(Display *d, unsigned char *values, unsigned t, struct config *cn
         );
     }
 
-	XDestroyImage(image);
+    if (image != NULL && image != g_shmimage) {
+        XDestroyImage(image);
+    }
 }

@@ -3,7 +3,7 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
-
+#include <time.h>
 #include "screen.h"
 	
 struct config_value

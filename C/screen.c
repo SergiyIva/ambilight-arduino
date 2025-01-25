@@ -243,6 +243,10 @@ static void init_xshm(Display *d, int width, int height)
 void get_colors(Display *d, unsigned char *values, unsigned t, struct config *cnf) {
 	srand(t); // Initialising random
 
+    if (!g_shmimage){
+        init_xshm(d, cnf->horizontal_pixel_count, cnf->vertical_pixel_count);
+    }
+
     XImage *image = NULL;
 
     if (g_use_shm && g_shmimage) {
